@@ -237,11 +237,34 @@
     letter-spacing: 1px;
   }
   .perf-readout span {
-    font-size: 13px;
+    font-size: 12px;
     color: var(--accent3);
     text-align: center;
-    min-height: 18px;
+    height: 36px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    white-space: nowrap;
   }
+
+  .perf-vol-row {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 10px;
+    color: var(--dim);
+    letter-spacing: 1px;
+  }
+  .perf-vol-row label { width: 50px; flex-shrink: 0; }
+  .perf-vol-row input[type=range] {
+    flex: 1;
+    accent-color: var(--accent);
+    cursor: pointer;
+    height: 22px;
+  }
+  .perf-vol-row span { width: 36px; text-align: right; color: var(--accent); flex-shrink: 0; }
 
   #btn-stop-perf {
     width: 100%;
@@ -307,6 +330,12 @@
       <label>FILTRE</label>
       <span id="perf-filter">—</span>
     </div>
+  </div>
+
+  <div class="perf-vol-row">
+    <label>VOLUME</label>
+    <input type="range" id="perf-vol" min="0" max="150" value="100" step="1">
+    <span id="perf-vol-val">100%</span>
   </div>
 
   <button id="btn-stop-perf">■ ARRÊTER</button>
@@ -503,10 +532,7 @@ function startPerfAudio(type) {
   src.loopStart = 0;
   src.loopEnd = buf.duration;
 
-  const shaper = audioCtx.createWaveShaper();
-  shaper.curve = makeDriveCurve(1.5);
-
-  // 3 filtres parallèles, chacun avec son propre nœud de gain
+  // 3 filtres parallèles — sans WaveShaper (évite la dureté aux transitions)
   const LP = audioCtx.createBiquadFilter(); LP.type = 'lowpass';  LP.Q.value = 3; LP.frequency.value = 800;
   const BP = audioCtx.createBiquadFilter(); BP.type = 'bandpass'; BP.Q.value = 3; BP.frequency.value = 800;
   const HP = audioCtx.createBiquadFilter(); HP.type = 'highpass'; HP.Q.value = 3; HP.frequency.value = 800;
@@ -515,10 +541,10 @@ function startPerfAudio(type) {
   const gBP = audioCtx.createGain(); gBP.gain.value = 0;
   const gHP = audioCtx.createGain(); gHP.gain.value = 0;
 
-  const master = audioCtx.createGain(); master.gain.value = 0.75;
+  const master = audioCtx.createGain();
+  master.gain.value = (parseInt(document.getElementById('perf-vol').value) || 100) / 100 * 0.75;
 
-  src.connect(shaper);
-  shaper.connect(LP); shaper.connect(BP); shaper.connect(HP);
+  src.connect(LP); src.connect(BP); src.connect(HP);
   LP.connect(gLP); BP.connect(gBP); HP.connect(gHP);
   gLP.connect(master); gBP.connect(master); gHP.connect(master);
   master.connect(audioCtx.destination);
@@ -527,7 +553,7 @@ function startPerfAudio(type) {
   perfState.src = src;
   perfState.LP = LP; perfState.BP = BP; perfState.HP = HP;
   perfState.gLP = gLP; perfState.gBP = gBP; perfState.gHP = gHP;
-  perfState.shaper = shaper;
+  perfState.master = master;
 }
 
 function stopPerfAudio() {
@@ -535,12 +561,24 @@ function stopPerfAudio() {
   perfState.src = null;
   perfState.LP = null; perfState.BP = null; perfState.HP = null;
   perfState.gLP = null; perfState.gBP = null; perfState.gHP = null;
-  perfState.shaper = null;
+  perfState.master = null;
 }
 
-// ---- Gestionnaire orientation ----
+// ---- Volume live ----
+document.getElementById('perf-vol').addEventListener('input', (e) => {
+  const v = parseInt(e.target.value) / 100;
+  document.getElementById('perf-vol-val').textContent = e.target.value + '%';
+  if (perfState.master) perfState.master.gain.setTargetAtTime(v * 0.75, audioCtx.currentTime, 0.05);
+});
+
+// ---- Gestionnaire orientation (~30 fps max) ----
+let lastGyroTime = 0;
 function onOrientation(e) {
   if (e.beta === null || e.gamma === null) return;
+  const now = performance.now();
+  if (now - lastGyroTime < 33) return;
+  lastGyroTime = now;
+
   if (!perfState.calibrated) {
     perfState.betaCenter = e.beta;
     perfState.gammaCenter = e.gamma;
@@ -548,47 +586,44 @@ function onOrientation(e) {
   }
   const dBeta  = e.beta  - perfState.betaCenter;
   const dGamma = e.gamma - perfState.gammaCenter;
-  const now = audioCtx.currentTime;
-  const RAMP = 0.06; // 60 ms de lissage sur tous les paramètres audio
+  const actx = audioCtx.currentTime;
+  const RAMP = 0.15; // 150 ms — lissage généreux, élimine tout décrochage audible
 
-  // Pitch : lissage via setTargetAtTime (tc = 40 ms)
+  // Pitch
   const pitch = pitchForBeta(dBeta);
-  if (perfState.src) perfState.src.playbackRate.setTargetAtTime(pitch, now, 0.04);
+  if (perfState.src) perfState.src.playbackRate.setTargetAtTime(pitch, actx, RAMP);
 
-  // Filtre : position 0..1 → fondu croisé LP / BP / HP sans clic
+  // Position filtre 0..1 → fondu croisé continu avec courbes cosinus (énergie constante)
   const pos = filterPosForGamma(dGamma);
   const freq = freqForPos(pos);
-
-  // Gains : LP fort à gauche, BP au centre, HP à droite — chevauchement doux
-  const gL = Math.max(0, 1 - pos * 2);         // 1 à pos=0, 0 à pos=0.5
-  const gB = Math.max(0, 1 - Math.abs(pos - 0.5) * 4); // pic à pos=0.5
-  const gH = Math.max(0, pos * 2 - 1);         // 0 à pos=0.5, 1 à pos=1
+  const gL = Math.cos(pos * Math.PI / 2);       // 1→0 sur toute la plage
+  const gH = Math.sin(pos * Math.PI / 2);       // 0→1 sur toute la plage
+  const gB = Math.sin(pos * Math.PI);           // pic au centre, 0 aux bords
 
   if (perfState.gLP) {
-    perfState.gLP.gain.setTargetAtTime(gL, now, RAMP);
-    perfState.gBP.gain.setTargetAtTime(gB, now, RAMP);
-    perfState.gHP.gain.setTargetAtTime(gH, now, RAMP);
-    perfState.LP.frequency.setTargetAtTime(freq, now, RAMP);
-    perfState.BP.frequency.setTargetAtTime(freq, now, RAMP);
-    perfState.HP.frequency.setTargetAtTime(freq, now, RAMP);
+    perfState.gLP.gain.setTargetAtTime(gL, actx, RAMP);
+    perfState.gBP.gain.setTargetAtTime(gB, actx, RAMP);
+    perfState.gHP.gain.setTargetAtTime(gH, actx, RAMP);
+    perfState.LP.frequency.setTargetAtTime(freq, actx, RAMP);
+    perfState.BP.frequency.setTargetAtTime(freq, actx, RAMP);
+    perfState.HP.frequency.setTargetAtTime(freq, actx, RAMP);
   }
 
-  // Mise à jour UI
+  // Affichage — longueur fixe, pas de saut de mise en page
   const semitones = Math.round(12 * Math.log2(pitch) * 10) / 10;
-  document.getElementById('perf-pitch').textContent = (semitones >= 0 ? '+' : '') + semitones + ' st';
-  const typeLabel = pos < 0.3 ? 'PASSE-BAS' : pos > 0.7 ? 'PASSE-HAUT' : 'PASSE-BANDE';
-  document.getElementById('perf-filter').textContent = typeLabel + '\n' + Math.round(freq) + ' Hz';
+  const sign = semitones >= 0 ? '+' : '';
+  const typeLabel = pos < 0.35 ? 'PB' : pos > 0.65 ? 'PH' : 'BP';
+  document.getElementById('perf-pitch').textContent = sign + semitones + ' st';
+  document.getElementById('perf-filter').textContent = typeLabel + ' · ' + Math.round(freq) + ' Hz';
 
   // Visualiseur dot : gamma → x, beta → y (inversé)
-  const viz = document.getElementById('perf-viz');
-  const r = viz.offsetWidth / 2;
   const nx = Math.max(0, Math.min(1, (dGamma + 45) / 90));
   const ny = Math.max(0, Math.min(1, (dBeta + 45) / 90));
   const dot = document.getElementById('viz-dot');
   dot.style.left = (nx * 100) + '%';
   dot.style.top  = ((1-ny) * 100) + '%';
   const def = SOUND_TYPES.find(d => d.type === selectedType);
-  if (def) dot.style.background = dot.style.boxShadow = '', dot.style.background = def.color, dot.style.boxShadow = `0 0 14px 4px ${def.color}`;
+  if (def) { dot.style.background = def.color; dot.style.boxShadow = `0 0 14px 4px ${def.color}`; }
 }
 
 // ---- Démarrage mode perf ----
