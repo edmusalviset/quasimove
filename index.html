@@ -3267,7 +3267,7 @@ async function requestGyroPermission() {
       return result === 'granted';
     } catch(e) { return false; }
   }
-  return true; // Android / desktop : pas de permission explicite à demander
+  return true;
 }
 
 // Mouvement latéral (gamma, calibré) → type de filtre ET fréquence, en 3 zones
@@ -3326,13 +3326,16 @@ function stopGyroAudio() {
 
 function onGyroOrientation(e) {
   if (e.beta === null || e.gamma === null) return;
+
+  // Calibration : première lecture = position de référence
   if (!gyroState.calibrated) {
-    // Première lecture = position de référence : on joue à partir d'ici, peu importe comment le téléphone est tenu
-    gyroState.betaCenter = e.beta;
+    gyroState.betaCenter  = e.beta;
     gyroState.gammaCenter = e.gamma;
-    gyroState.calibrated = true;
-    return;
+    gyroState.calibrated  = true;
+    document.getElementById('gyro-pitch-val').textContent  = 'calibré ✓';
+    document.getElementById('gyro-filter-val').textContent = 'calibré ✓';
   }
+
   const dBeta  = e.beta  - gyroState.betaCenter;
   const dGamma = e.gamma - gyroState.gammaCenter;
 
@@ -3347,43 +3350,74 @@ function onGyroOrientation(e) {
     gyroState.filt2.frequency.value = freq;
   }
 
-  const pitchEl = document.getElementById('gyro-pitch-val');
-  const filterEl = document.getElementById('gyro-filter-val');
-  if (pitchEl)  pitchEl.textContent  = (Math.round(12 * Math.log2(pitch) * 10) / 10) + ' demi-tons';
-  if (filterEl) filterEl.textContent = ({lowpass:'PASSE-BAS', highpass:'PASSE-HAUT', bandpass:'PASSE-BANDE'})[type] + ' ' + Math.round(freq) + ' Hz';
+  const typeLabel = { lowpass:'PASSE-BAS', highpass:'PASSE-HAUT', bandpass:'PASSE-BANDE' };
+  document.getElementById('gyro-pitch-val').textContent  = (Math.round(12 * Math.log2(pitch) * 10) / 10) + ' st';
+  document.getElementById('gyro-filter-val').textContent = typeLabel[type] + ' ' + Math.round(freq) + ' Hz';
 }
 
 async function startGyroMode() {
-  if (!activeSample) { alert("Choisis d'abord un son dans la bibliothèque avant d'activer le mode geste."); return; }
+  // ⚠️ Sur iOS, requestPermission() DOIT être la toute première opération async,
+  // sinon iOS révoque le contexte "geste utilisateur" et refuse silencieusement.
+  let granted = true;
+  if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+    try {
+      const result = await DeviceOrientationEvent.requestPermission();
+      granted = result === 'granted';
+    } catch(e) { granted = false; }
+    if (!granted) {
+      alert("Permission refusée pour les capteurs de mouvement.\nVa dans Réglages → Safari → Capteurs de mouvement et d'orientation pour l'autoriser.");
+      return;
+    }
+  }
+
+  if (!activeSample) {
+    alert("Choisis d'abord un son dans la bibliothèque de l'atelier.");
+    return;
+  }
   if (typeof window.DeviceOrientationEvent === 'undefined') {
-    alert("Cet appareil ou ce navigateur ne semble pas donner accès aux capteurs de mouvement.");
+    alert("Cet appareil ou ce navigateur ne donne pas accès aux capteurs de mouvement.");
     return;
   }
-  const granted = await requestGyroPermission();
-  if (!granted) {
-    alert("Permission refusée pour les capteurs de mouvement. Vérifie les réglages du navigateur.");
-    return;
-  }
+
   ensureAudioCtx();
   if (audioCtx.state === 'suspended') await audioCtx.resume();
 
   gyroState.calibrated = false;
   document.getElementById('gyro-sample-name').textContent = activeSample.name;
-  document.getElementById('gyro-pitch-val').textContent = '—';
-  document.getElementById('gyro-filter-val').textContent = '—';
+  document.getElementById('gyro-pitch-val').textContent  = 'bouge le téléphone…';
+  document.getElementById('gyro-filter-val').textContent = '…';
+
+  // Bloquer le canvas en dessous pendant le mode geste
+  canvas.style.pointerEvents = 'none';
   document.getElementById('gyro-overlay').style.display = 'flex';
 
   startGyroAudio();
-  gyroState.handler = onGyroOrientation;
-  window.addEventListener('deviceorientation', gyroState.handler);
+
+  // Essai deviceorientationabsolute d'abord (Android Chrome), puis deviceorientation (iOS + autres)
+  let fired = false;
+  const testHandler = () => { fired = true; };
+  window.addEventListener('deviceorientationabsolute', testHandler, { once: true });
+  setTimeout(() => {
+    window.removeEventListener('deviceorientationabsolute', testHandler);
+    const evt = fired ? 'deviceorientationabsolute' : 'deviceorientation';
+    gyroState.handler = onGyroOrientation;
+    gyroState.eventName = evt;
+    window.addEventListener(evt, gyroState.handler);
+  }, 400);
+
   gyroState.active = true;
 }
 
 function stopGyroMode() {
-  if (gyroState.handler) window.removeEventListener('deviceorientation', gyroState.handler);
+  if (gyroState.handler) {
+    window.removeEventListener(gyroState.eventName || 'deviceorientation', gyroState.handler);
+    window.removeEventListener('deviceorientationabsolute', gyroState.handler);
+  }
   gyroState.handler = null;
+  gyroState.eventName = null;
   stopGyroAudio();
   gyroState.active = false;
+  canvas.style.pointerEvents = '';
   document.getElementById('gyro-overlay').style.display = 'none';
 }
 
