@@ -322,7 +322,9 @@ let audioCtx = null;
 let impulseSourceBuffer = null;
 let selectedType = null;
 let perfState = {
-  active: false, src: null, filt1: null, filt2: null, shaper: null,
+  active: false, src: null, shaper: null,
+  LP: null, BP: null, HP: null,
+  gLP: null, gBP: null, gHP: null,
   handler: null, eventName: null, calibrated: false,
   betaCenter: 0, gammaCenter: 0
 };
@@ -453,6 +455,15 @@ function generateBuffer(type) {
     if (ch[i] > 1) ch[i] = 1;
     else if (ch[i] < -1) ch[i] = -1;
   }
+
+  // Fondu court aux deux extrémités du buffer pour éviter les clics au rebouclage
+  const fadeLen = Math.round(sr * 0.025); // 25 ms
+  for (let i = 0; i < fadeLen; i++) {
+    const t = i / fadeLen;
+    ch[i] *= t;
+    ch[len - 1 - i] *= t;
+  }
+
   const buf = audioCtx.createBuffer(1, len, sr);
   buf.copyToChannel(ch, 0);
   return buf;
@@ -465,15 +476,17 @@ function makeDriveCurve(amount) {
   return curve;
 }
 
-// ---- Filtre selon inclinaison latérale ----
-function filterForGamma(dGamma) {
-  const g = Math.max(-45, Math.min(45, dGamma));
-  let type, t;
-  if (g < -15)     { type = 'lowpass';  t = (g+45)/30; }
-  else if (g > 15) { type = 'highpass'; t = (g-15)/30; }
-  else             { type = 'bandpass'; t = (g+15)/30; }
-  t = Math.max(0, Math.min(1, t));
-  return { type, freq: 30 * Math.pow(6000/30, t) };
+// ---- Calcul de la position de filtre (0..1) selon inclinaison latérale ----
+// On ne change plus de type : on utilise une position continue 0→1
+// qui pilote 3 gains en fondu croisé (LP → BP → HP)
+function filterPosForGamma(dGamma) {
+  // dGamma : -45 = tout à gauche, +45 = tout à droite → 0..1
+  return Math.max(0, Math.min(1, (dGamma + 45) / 90));
+}
+
+// Fréquence continue sur toute la plage, indépendante du type
+function freqForPos(pos) {
+  return 40 * Math.pow(8000 / 40, pos);
 }
 
 function pitchForBeta(dBeta) {
@@ -481,29 +494,48 @@ function pitchForBeta(dBeta) {
   return Math.pow(2, norm * PITCH_RANGE/2);
 }
 
-// ---- Démarrage audio ----
+// ---- Démarrage audio : 3 filtres parallèles + fondu croisé ----
 function startPerfAudio(type) {
   const buf = generateBuffer(type);
   const src = audioCtx.createBufferSource();
   src.buffer = buf;
   src.loop = true;
+  src.loopStart = 0;
+  src.loopEnd = buf.duration;
+
   const shaper = audioCtx.createWaveShaper();
-  shaper.curve = makeDriveCurve(2);
-  const f1 = audioCtx.createBiquadFilter();
-  const f2 = audioCtx.createBiquadFilter();
-  f1.type = f2.type = 'lowpass';
-  f1.Q.value = f2.Q.value = 4;
-  f1.frequency.value = f2.frequency.value = 4000;
-  const gain = audioCtx.createGain();
-  gain.gain.value = 0.8;
-  src.connect(shaper); shaper.connect(f1); f1.connect(f2); f2.connect(gain); gain.connect(audioCtx.destination);
+  shaper.curve = makeDriveCurve(1.5);
+
+  // 3 filtres parallèles, chacun avec son propre nœud de gain
+  const LP = audioCtx.createBiquadFilter(); LP.type = 'lowpass';  LP.Q.value = 3; LP.frequency.value = 800;
+  const BP = audioCtx.createBiquadFilter(); BP.type = 'bandpass'; BP.Q.value = 3; BP.frequency.value = 800;
+  const HP = audioCtx.createBiquadFilter(); HP.type = 'highpass'; HP.Q.value = 3; HP.frequency.value = 800;
+
+  const gLP = audioCtx.createGain(); gLP.gain.value = 1;
+  const gBP = audioCtx.createGain(); gBP.gain.value = 0;
+  const gHP = audioCtx.createGain(); gHP.gain.value = 0;
+
+  const master = audioCtx.createGain(); master.gain.value = 0.75;
+
+  src.connect(shaper);
+  shaper.connect(LP); shaper.connect(BP); shaper.connect(HP);
+  LP.connect(gLP); BP.connect(gBP); HP.connect(gHP);
+  gLP.connect(master); gBP.connect(master); gHP.connect(master);
+  master.connect(audioCtx.destination);
+
   src.start();
-  perfState.src = src; perfState.filt1 = f1; perfState.filt2 = f2; perfState.shaper = shaper;
+  perfState.src = src;
+  perfState.LP = LP; perfState.BP = BP; perfState.HP = HP;
+  perfState.gLP = gLP; perfState.gBP = gBP; perfState.gHP = gHP;
+  perfState.shaper = shaper;
 }
 
 function stopPerfAudio() {
   if (perfState.src) { try { perfState.src.stop(); } catch(e) {} }
-  perfState.src = null; perfState.filt1 = null; perfState.filt2 = null; perfState.shaper = null;
+  perfState.src = null;
+  perfState.LP = null; perfState.BP = null; perfState.HP = null;
+  perfState.gLP = null; perfState.gBP = null; perfState.gHP = null;
+  perfState.shaper = null;
 }
 
 // ---- Gestionnaire orientation ----
@@ -516,20 +548,36 @@ function onOrientation(e) {
   }
   const dBeta  = e.beta  - perfState.betaCenter;
   const dGamma = e.gamma - perfState.gammaCenter;
+  const now = audioCtx.currentTime;
+  const RAMP = 0.06; // 60 ms de lissage sur tous les paramètres audio
 
+  // Pitch : lissage via setTargetAtTime (tc = 40 ms)
   const pitch = pitchForBeta(dBeta);
-  if (perfState.src) perfState.src.playbackRate.value = pitch;
+  if (perfState.src) perfState.src.playbackRate.setTargetAtTime(pitch, now, 0.04);
 
-  const { type, freq } = filterForGamma(dGamma);
-  if (perfState.filt1) {
-    perfState.filt1.type = type; perfState.filt2.type = type;
-    perfState.filt1.frequency.value = freq; perfState.filt2.frequency.value = freq;
+  // Filtre : position 0..1 → fondu croisé LP / BP / HP sans clic
+  const pos = filterPosForGamma(dGamma);
+  const freq = freqForPos(pos);
+
+  // Gains : LP fort à gauche, BP au centre, HP à droite — chevauchement doux
+  const gL = Math.max(0, 1 - pos * 2);         // 1 à pos=0, 0 à pos=0.5
+  const gB = Math.max(0, 1 - Math.abs(pos - 0.5) * 4); // pic à pos=0.5
+  const gH = Math.max(0, pos * 2 - 1);         // 0 à pos=0.5, 1 à pos=1
+
+  if (perfState.gLP) {
+    perfState.gLP.gain.setTargetAtTime(gL, now, RAMP);
+    perfState.gBP.gain.setTargetAtTime(gB, now, RAMP);
+    perfState.gHP.gain.setTargetAtTime(gH, now, RAMP);
+    perfState.LP.frequency.setTargetAtTime(freq, now, RAMP);
+    perfState.BP.frequency.setTargetAtTime(freq, now, RAMP);
+    perfState.HP.frequency.setTargetAtTime(freq, now, RAMP);
   }
 
   // Mise à jour UI
   const semitones = Math.round(12 * Math.log2(pitch) * 10) / 10;
   document.getElementById('perf-pitch').textContent = (semitones >= 0 ? '+' : '') + semitones + ' st';
-  document.getElementById('perf-filter').textContent = ({lowpass:'PASSE-BAS', highpass:'PASSE-HAUT', bandpass:'PASSE-BANDE'})[type] + '\n' + Math.round(freq) + ' Hz';
+  const typeLabel = pos < 0.3 ? 'PASSE-BAS' : pos > 0.7 ? 'PASSE-HAUT' : 'PASSE-BANDE';
+  document.getElementById('perf-filter').textContent = typeLabel + '\n' + Math.round(freq) + ' Hz';
 
   // Visualiseur dot : gamma → x, beta → y (inversé)
   const viz = document.getElementById('perf-viz');
