@@ -435,7 +435,7 @@ let impulseSourceBuffer = null;
 let selectedType = null;
 let perfState = {
   active: false, src: null,
-  lp: null, peak: null, master: null,
+  lp: null, master: null,
   handler: null, eventName: null, calibrated: false,
   betaCenter: 0, gammaCenter: 0
 };
@@ -614,9 +614,9 @@ function filterPosForGamma(dGamma) {
   return Math.max(0, Math.min(1, (dGamma + 45) / 90));
 }
 
-// Fréquence de coupure : 80 Hz (tout à gauche, très sombre) → 8000 Hz (tout à droite, très brillant)
+// Fréquence de coupure : 200 Hz (gauche) → 5000 Hz (droite), log
 function freqForPos(pos) {
-  return 80 * Math.pow(8000 / 80, pos);
+  return 200 * Math.pow(5000 / 200, pos);
 }
 
 function pitchForBeta(dBeta) {
@@ -624,41 +624,31 @@ function pitchForBeta(dBeta) {
   return Math.pow(2, norm * PITCH_RANGE / 2);
 }
 
-// ---- Chaîne audio : LP (balayage) + peaking (résonance) ----
+// ---- Chaîne audio : source → LP → master ----
+// Le Q du LP EST la résonance : à Q=0.7 c'est plat,
+// à Q=8 ça chante fort, à Q=15 c'est très résonant.
+// C'est le principe du filtre Moog, fiable sur tous les navigateurs.
 function startPerfAudio(type) {
   const buf = generateBuffer(type);
   const src = audioCtx.createBufferSource();
   src.buffer = buf;
   src.loop = true;
-  src.loopStart = 0;
-  src.loopEnd = buf.duration;
 
-  // Filtre passe-bas : fréquence pilotée par le balayage latéral
   const lp = audioCtx.createBiquadFilter();
   lp.type = 'lowpass';
-  lp.frequency.value = 800;
-  lp.Q.value = 0.7;
-
-  // Filtre peaking en série : booste à la fréquence de coupure
-  // Q et gain contrôlés par la bande tactile
-  const peak = audioCtx.createBiquadFilter();
-  peak.type = 'peaking';
-  peak.frequency.value = 800;
-  peak.Q.value = currentQ;
-  peak.gain.value = qToDb(currentQ);
+  lp.frequency.value = freqForPos(0.5); // milieu au démarrage
+  lp.Q.value = currentQ;
 
   const master = audioCtx.createGain();
   master.gain.value = (parseInt(document.getElementById('perf-vol').value) || 100) / 100 * 0.75;
 
   src.connect(lp);
-  lp.connect(peak);
-  peak.connect(master);
+  lp.connect(master);
   master.connect(audioCtx.destination);
 
   src.start();
   perfState.src = src;
   perfState.lp = lp;
-  perfState.peak = peak;
   perfState.master = master;
 }
 
@@ -666,14 +656,7 @@ function stopPerfAudio() {
   if (perfState.src) { try { perfState.src.stop(); } catch(e) {} }
   perfState.src = null;
   perfState.lp = null;
-  perfState.peak = null;
   perfState.master = null;
-}
-
-// Q → gain en dB pour le filtre peaking (0 à +24 dB)
-function qToDb(q) {
-  const norm = Math.max(0, Math.min(1, (q - Q_MIN) / (Q_MAX - Q_MIN)));
-  return norm * 24;
 }
 
 // ---- Volume live ----
@@ -705,13 +688,10 @@ function onOrientation(e) {
   const pitch = pitchForBeta(dBeta);
   if (perfState.src) perfState.src.playbackRate.setTargetAtTime(pitch, actx, RAMP);
 
-  // Filtre (gauche/droite) : LP + peaking suivent la même fréquence
+  // Filtre (gauche/droite)
   const pos = filterPosForGamma(dGamma);
   const freq = freqForPos(pos);
-  if (perfState.lp) {
-    perfState.lp.frequency.setTargetAtTime(freq, actx, RAMP);
-    if (perfState.peak) perfState.peak.frequency.setTargetAtTime(freq, actx, RAMP);
-  }
+  if (perfState.lp) perfState.lp.frequency.setTargetAtTime(freq, actx, RAMP);
 
   // Affichage
   const semitones = Math.round(12 * Math.log2(pitch) * 10) / 10;
@@ -862,10 +842,7 @@ resStrip.addEventListener('touchmove', (e) => {
 }, { passive: false });
 
 function applyQ(q) {
-  if (!audioCtx || !perfState.peak) return;
-  const now = audioCtx.currentTime;
-  perfState.peak.Q.setTargetAtTime(q, now, 0.06);
-  perfState.peak.gain.setTargetAtTime(qToDb(q), now, 0.06);
+  if (perfState.lp) perfState.lp.Q.setTargetAtTime(q, audioCtx.currentTime, 0.08);
 }
 
 document.getElementById('btn-stop-perf').addEventListener('click', stopPerf);
