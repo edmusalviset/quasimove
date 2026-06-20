@@ -278,6 +278,77 @@
     font-weight: bold;
   }
 
+  /* ---- BANDE DE RÉSONANCE (bord droit, mode portrait) ---- */
+  #res-strip {
+    position: fixed;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    width: 64px;
+    z-index: 10000;
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    justify-content: space-between;
+    padding: 48px 0 72px;
+    background: rgba(10,10,11,0.85);
+    border-left: 1px solid var(--border);
+    touch-action: none;
+    user-select: none;
+  }
+  #res-strip.visible { display: flex; }
+  #res-strip-label-top {
+    font-family: 'Space Mono', monospace;
+    font-size: 9px;
+    color: var(--dim);
+    letter-spacing: 1px;
+    writing-mode: vertical-rl;
+    text-orientation: mixed;
+    transform: rotate(180deg);
+  }
+  #res-strip-label-bottom {
+    font-family: 'Space Mono', monospace;
+    font-size: 9px;
+    color: var(--dim);
+    letter-spacing: 1px;
+    writing-mode: vertical-rl;
+    text-orientation: mixed;
+    transform: rotate(180deg);
+  }
+  #res-track {
+    flex: 1;
+    width: 28px;
+    position: relative;
+    background: var(--surface2);
+    border-radius: 14px;
+    margin: 12px 0;
+    overflow: visible;
+  }
+  #res-fill {
+    position: absolute;
+    bottom: 0; left: 0; right: 0;
+    border-radius: 14px;
+    background: var(--accent3);
+    transition: height 0.06s;
+    opacity: 0.6;
+  }
+  #res-thumb {
+    position: absolute;
+    left: 50%;
+    width: 28px; height: 28px;
+    border-radius: 50%;
+    background: var(--accent3);
+    transform: translate(-50%, 50%);
+    box-shadow: 0 0 10px 2px var(--accent3);
+    transition: bottom 0.06s;
+  }
+  #res-val {
+    font-family: 'Space Mono', monospace;
+    font-size: 11px;
+    color: var(--accent3);
+    text-align: center;
+  }
+
   footer {
     flex-shrink: 0;
     text-align: center;
@@ -339,6 +410,17 @@
   </div>
 
   <button id="btn-stop-perf">■ ARRÊTER</button>
+</div>
+
+<!-- BANDE DE RÉSONANCE (bord droit, portrait) -->
+<div id="res-strip">
+  <div id="res-strip-label-top">RÉSONANCE</div>
+  <div id="res-track">
+    <div id="res-fill" style="height:0%"></div>
+    <div id="res-thumb" style="bottom:0%"></div>
+  </div>
+  <div id="res-val">Q 1.0</div>
+  <div id="res-strip-label-bottom">DOUX</div>
 </div>
 
 <script>
@@ -555,9 +637,9 @@ function startPerfAudio(type) {
   src.loopEnd = buf.duration;
 
   // 3 filtres parallèles — sans WaveShaper (évite la dureté aux transitions)
-  const LP = audioCtx.createBiquadFilter(); LP.type = 'lowpass';  LP.Q.value = 1.2; LP.frequency.value = 800;
-  const BP = audioCtx.createBiquadFilter(); BP.type = 'bandpass'; BP.Q.value = 1.2; BP.frequency.value = 800;
-  const HP = audioCtx.createBiquadFilter(); HP.type = 'highpass'; HP.Q.value = 1.2; HP.frequency.value = 800;
+  const LP = audioCtx.createBiquadFilter(); LP.type = 'lowpass';  LP.Q.value = currentQ; LP.frequency.value = 800;
+  const BP = audioCtx.createBiquadFilter(); BP.type = 'bandpass'; BP.Q.value = currentQ; BP.frequency.value = 800;
+  const HP = audioCtx.createBiquadFilter(); HP.type = 'highpass'; HP.Q.value = currentQ; HP.frequency.value = 800;
 
   const gLP = audioCtx.createGain(); gLP.gain.value = 1;
   const gBP = audioCtx.createGain(); gBP.gain.value = 0;
@@ -683,6 +765,10 @@ async function startPerf() {
   }, 400);
 
   document.getElementById('perf-overlay').classList.add('visible');
+  document.getElementById('res-strip').classList.add('visible');
+  // Initialise la bande sur la position courante
+  const initPct = Math.log(currentQ / Q_MIN) / Math.log(Q_MAX / Q_MIN);
+  updateResUi(Math.max(0, Math.min(1, initPct)));
   perfState.active = true;
 }
 
@@ -694,6 +780,7 @@ function stopPerf() {
   perfState.handler = null; perfState.eventName = null; perfState.active = false;
   stopPerfAudio();
   document.getElementById('perf-overlay').classList.remove('visible');
+  document.getElementById('res-strip').classList.remove('visible');
   document.getElementById('btn-play').classList.remove('playing');
   document.getElementById('btn-play').textContent = '▶ JOUER';
 }
@@ -733,6 +820,55 @@ document.getElementById('btn-play').addEventListener('click', () => {
   if (perfState.active) { stopPerf(); return; }
   startPerf();
 });
+// ---- BANDE DE RÉSONANCE TACTILE ----
+// Q de 0.8 (doux) à 12 (quasi auto-oscillant), en bas = doux, en haut = fort
+const Q_MIN = 0.8, Q_MAX = 12;
+let currentQ = 1.5; // valeur par défaut plus marquée qu'avant
+
+function qFromStripPos(pct) {
+  // pct : 0 = bas (doux), 1 = haut (résonant) — courbe log pour plus de précision en bas
+  return Q_MIN * Math.pow(Q_MAX / Q_MIN, pct);
+}
+
+function updateResUi(pct) {
+  const q = qFromStripPos(pct);
+  const pctStr = (pct * 100).toFixed(1) + '%';
+  document.getElementById('res-fill').style.height = pctStr;
+  document.getElementById('res-thumb').style.bottom = pctStr;
+  document.getElementById('res-val').textContent = 'Q ' + q.toFixed(1);
+  return q;
+}
+
+function stripPosFromTouch(touch) {
+  const strip = document.getElementById('res-track');
+  const rect = strip.getBoundingClientRect();
+  const raw = 1 - (touch.clientY - rect.top) / rect.height;
+  return Math.max(0, Math.min(1, raw));
+}
+
+const resStrip = document.getElementById('res-strip');
+
+resStrip.addEventListener('touchstart', (e) => {
+  e.preventDefault();
+  const pct = stripPosFromTouch(e.touches[0]);
+  currentQ = updateResUi(pct);
+  applyQ(currentQ);
+}, { passive: false });
+
+resStrip.addEventListener('touchmove', (e) => {
+  e.preventDefault();
+  const pct = stripPosFromTouch(e.touches[0]);
+  currentQ = updateResUi(pct);
+  applyQ(currentQ);
+}, { passive: false });
+
+function applyQ(q) {
+  const now = audioCtx ? audioCtx.currentTime : 0;
+  if (perfState.LP) { perfState.LP.Q.setTargetAtTime(q, now, 0.05); }
+  if (perfState.BP) { perfState.BP.Q.setTargetAtTime(q, now, 0.05); }
+  if (perfState.HP) { perfState.HP.Q.setTargetAtTime(q, now, 0.05); }
+}
+
 document.getElementById('btn-stop-perf').addEventListener('click', stopPerf);
 
 // ---- Chargement son source granulaire ----
