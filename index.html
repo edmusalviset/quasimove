@@ -394,7 +394,10 @@
 
   <div id="play-bar">
     <div class="selected-name" id="selected-name">—</div>
-    <button id="btn-play">▶ JOUER</button>
+    <div style="display:flex;gap:10px;align-items:center;width:100%">
+      <button id="btn-play" style="flex:1">▶ JOUER</button>
+      <button id="btn-strip-side" title="Côté de la bande de résonance" style="flex-shrink:0;padding:18px 14px;font-size:16px">RESO ▷</button>
+    </div>
   </div>
 
   <footer>© 2025 jm voiront — QUASIMOVE — CC BY-NC-ND 4.0</footer>
@@ -444,7 +447,6 @@
   </div>
   <div id="res-val">Q 1.0</div>
   <div id="res-strip-label-bottom">DOUX</div>
-  <button id="btn-res-side" title="Déplacer la bande">⇄</button>
 </div>
 
 <script>
@@ -876,7 +878,6 @@ function stripPosFromTouch(touch) {
 const resStrip = document.getElementById('res-strip');
 
 resStrip.addEventListener('touchstart', (e) => {
-  if (e.target.id === 'btn-res-side') return;
   e.preventDefault();
   const pct = stripPosFromTouch(e.touches[0]);
   currentQ = updateResUi(pct);
@@ -884,7 +885,6 @@ resStrip.addEventListener('touchstart', (e) => {
 }, { passive: false });
 
 resStrip.addEventListener('touchmove', (e) => {
-  if (e.target.id === 'btn-res-side') return;
   e.preventDefault();
   const pct = stripPosFromTouch(e.touches[0]);
   currentQ = updateResUi(pct);
@@ -900,16 +900,15 @@ function applyQ(q) {
   }
 }
 
-const btnResSide = document.getElementById('btn-res-side');
-btnResSide.addEventListener('click', (e) => {
-  e.stopPropagation();
-  document.getElementById('res-strip').classList.toggle('left-side');
+let stripOnLeft = false;
+
+document.getElementById('btn-strip-side').addEventListener('click', () => {
+  stripOnLeft = !stripOnLeft;
+  document.getElementById('res-strip').classList.toggle('left-side', stripOnLeft);
+  document.getElementById('btn-strip-side').textContent = stripOnLeft ? '◁ RESO' : 'RESO ▷';
 });
-btnResSide.addEventListener('touchend', (e) => {
-  e.stopPropagation();
-  e.preventDefault();
-  document.getElementById('res-strip').classList.toggle('left-side');
-});
+
+document.getElementById('btn-stop-perf').addEventListener('click', stopPerf);
 
 // ---- Chargement son source granulaire ----
 function loadImpulse() {
