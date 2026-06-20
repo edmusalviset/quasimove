@@ -459,9 +459,8 @@ let audioCtx = null;
 let impulseSourceBuffer = null;
 let selectedType = null;
 let perfState = {
-  active: false, src: null, shaper: null,
-  LP: null, BP: null, HP: null,
-  gLP: null, gBP: null, gHP: null,
+  active: false, src: null,
+  lp: null, peak: null, master: null,
   handler: null, eventName: null, calibrated: false,
   betaCenter: 0, gammaCenter: 0
 };
