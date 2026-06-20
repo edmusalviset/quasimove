@@ -628,6 +628,14 @@ function pitchForBeta(dBeta) {
 }
 
 // ---- Démarrage audio : 3 filtres parallèles + fondu croisé ----
+function makeResoCurve(drive) {
+  // Saturation douce tanh : donne du grain sans clic
+  const n = 1024, c = new Float32Array(n);
+  const k = Math.max(0.001, drive), norm = Math.tanh(k);
+  for (let i = 0; i < n; i++) c[i] = Math.tanh(k * ((i / (n-1)) * 2 - 1)) / norm;
+  return c;
+}
+
 function startPerfAudio(type) {
   const buf = generateBuffer(type);
   const src = audioCtx.createBufferSource();
@@ -636,27 +644,53 @@ function startPerfAudio(type) {
   src.loopStart = 0;
   src.loopEnd = buf.duration;
 
-  // 3 filtres parallèles — sans WaveShaper (évite la dureté aux transitions)
-  const LP = audioCtx.createBiquadFilter(); LP.type = 'lowpass';  LP.Q.value = currentQ; LP.frequency.value = 800;
-  const BP = audioCtx.createBiquadFilter(); BP.type = 'bandpass'; BP.Q.value = currentQ; BP.frequency.value = 800;
-  const HP = audioCtx.createBiquadFilter(); HP.type = 'highpass'; HP.Q.value = currentQ; HP.frequency.value = 800;
+  // ---- Étage 1 : drive avant le filtre (s'intensifie avec la résonance) ----
+  const drive = audioCtx.createWaveShaper();
+  drive.curve = makeResoCurve(1 + (currentQ / Q_MAX) * 6);
+
+  // ---- Étage 2 : 3 filtres parallèles pour la couleur (LP/BP/HP) ----
+  const LP = audioCtx.createBiquadFilter(); LP.type = 'lowpass';  LP.Q.value = 1; LP.frequency.value = 800;
+  const BP = audioCtx.createBiquadFilter(); BP.type = 'bandpass'; BP.Q.value = 1; BP.frequency.value = 800;
+  const HP = audioCtx.createBiquadFilter(); HP.type = 'highpass'; HP.Q.value = 1; HP.frequency.value = 800;
 
   const gLP = audioCtx.createGain(); gLP.gain.value = 1;
   const gBP = audioCtx.createGain(); gBP.gain.value = 0;
   const gHP = audioCtx.createGain(); gHP.gain.value = 0;
 
-  const master = audioCtx.createGain();
-  master.gain.value = (parseInt(document.getElementById('perf-vol').value) || 100) / 100 * 0.75;
+  // Nœud de mixage des 3 couleurs
+  const mix = audioCtx.createGain(); mix.gain.value = 0.85;
 
-  src.connect(LP); src.connect(BP); src.connect(HP);
+  // ---- Étage 3 : filtre résonant en SÉRIE après le mix — c'est lui qui hurle ----
+  const reso = audioCtx.createBiquadFilter();
+  reso.type = 'bandpass';
+  reso.frequency.value = 800;
+  reso.Q.value = currentQ;
+
+  // Gain de compensation : haute résonance = volume naturellement bas, on compense
+  const compGain = audioCtx.createGain();
+  const qNorm = Math.max(0, (currentQ - Q_MIN) / (Q_MAX - Q_MIN));
+  compGain.gain.value = 1 + qNorm * 2.5;
+
+  const master = audioCtx.createGain();
+  master.gain.value = (parseInt(document.getElementById('perf-vol').value) || 100) / 100 * 0.6;
+
+  // Câblage : src → drive → [LP/BP/HP] → mix → reso → compGain → master → out
+  src.connect(drive);
+  drive.connect(LP); drive.connect(BP); drive.connect(HP);
   LP.connect(gLP); BP.connect(gBP); HP.connect(gHP);
-  gLP.connect(master); gBP.connect(master); gHP.connect(master);
+  gLP.connect(mix); gBP.connect(mix); gHP.connect(mix);
+  mix.connect(reso);
+  reso.connect(compGain);
+  compGain.connect(master);
   master.connect(audioCtx.destination);
 
   src.start();
   perfState.src = src;
   perfState.LP = LP; perfState.BP = BP; perfState.HP = HP;
   perfState.gLP = gLP; perfState.gBP = gBP; perfState.gHP = gHP;
+  perfState.reso = reso;
+  perfState.drive = drive;
+  perfState.compGain = compGain;
   perfState.master = master;
 }
 
@@ -665,6 +699,7 @@ function stopPerfAudio() {
   perfState.src = null;
   perfState.LP = null; perfState.BP = null; perfState.HP = null;
   perfState.gLP = null; perfState.gBP = null; perfState.gHP = null;
+  perfState.reso = null; perfState.drive = null; perfState.compGain = null;
   perfState.master = null;
 }
 
@@ -711,6 +746,8 @@ function onOrientation(e) {
     perfState.LP.frequency.setTargetAtTime(freq, actx, RAMP);
     perfState.BP.frequency.setTargetAtTime(freq, actx, RAMP);
     perfState.HP.frequency.setTargetAtTime(freq, actx, RAMP);
+    // Le filtre résonant série suit la même fréquence de balayage
+    if (perfState.reso) perfState.reso.frequency.setTargetAtTime(freq, actx, RAMP);
   }
 
   // Affichage — longueur fixe, pas de saut de mise en page
@@ -822,11 +859,10 @@ document.getElementById('btn-play').addEventListener('click', () => {
 });
 // ---- BANDE DE RÉSONANCE TACTILE ----
 // Q de 0.8 (doux) à 12 (quasi auto-oscillant), en bas = doux, en haut = fort
-const Q_MIN = 0.8, Q_MAX = 12;
-let currentQ = 1.5; // valeur par défaut plus marquée qu'avant
+const Q_MIN = 0.5, Q_MAX = 40;
+let currentQ = 1.5;
 
 function qFromStripPos(pct) {
-  // pct : 0 = bas (doux), 1 = haut (résonant) — courbe log pour plus de précision en bas
   return Q_MIN * Math.pow(Q_MAX / Q_MIN, pct);
 }
 
@@ -863,10 +899,30 @@ resStrip.addEventListener('touchmove', (e) => {
 }, { passive: false });
 
 function applyQ(q) {
-  const now = audioCtx ? audioCtx.currentTime : 0;
-  if (perfState.LP) { perfState.LP.Q.setTargetAtTime(q, now, 0.05); }
-  if (perfState.BP) { perfState.BP.Q.setTargetAtTime(q, now, 0.05); }
-  if (perfState.HP) { perfState.HP.Q.setTargetAtTime(q, now, 0.05); }
+  if (!audioCtx) return;
+  const now = audioCtx.currentTime;
+  const RAMP = 0.06;
+
+  // Filtre résonant série — c'est lui qui fait le son spectaculaire
+  if (perfState.reso) perfState.reso.Q.setTargetAtTime(q, now, RAMP);
+
+  // Les filtres parallèles restent doux pour la couleur (Q fixe bas)
+  // Drive : plus de Q = plus de grain qui pousse dans le filtre
+  if (perfState.drive) {
+    const dAmt = 1 + (q / Q_MAX) * 8;
+    perfState.drive.curve = makeResoCurve(dAmt);
+  }
+
+  // Gain de compensation : la résonance serre la bande → moins de volume
+  if (perfState.compGain) {
+    const qNorm = Math.max(0, (q - Q_MIN) / (Q_MAX - Q_MIN));
+    perfState.compGain.gain.setTargetAtTime(1 + qNorm * 3, now, RAMP);
+  }
+
+  // Le filtre série suit aussi la fréquence courante de la couleur
+  if (perfState.reso && perfState.LP) {
+    perfState.reso.frequency.setTargetAtTime(perfState.LP.frequency.value, now, RAMP);
+  }
 }
 
 document.getElementById('btn-stop-perf').addEventListener('click', stopPerf);
