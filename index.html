@@ -317,6 +317,8 @@
     border-radius: 4px;
     cursor: pointer;
     z-index: 10001;
+    touch-action: auto;
+    pointer-events: auto;
   }
   #res-strip-label-top {
     font-family: 'Space Mono', monospace;
@@ -874,6 +876,7 @@ function stripPosFromTouch(touch) {
 const resStrip = document.getElementById('res-strip');
 
 resStrip.addEventListener('touchstart', (e) => {
+  if (e.target.id === 'btn-res-side') return;
   e.preventDefault();
   const pct = stripPosFromTouch(e.touches[0]);
   currentQ = updateResUi(pct);
@@ -881,6 +884,7 @@ resStrip.addEventListener('touchstart', (e) => {
 }, { passive: false });
 
 resStrip.addEventListener('touchmove', (e) => {
+  if (e.target.id === 'btn-res-side') return;
   e.preventDefault();
   const pct = stripPosFromTouch(e.touches[0]);
   currentQ = updateResUi(pct);
@@ -896,8 +900,14 @@ function applyQ(q) {
   }
 }
 
-document.getElementById('btn-res-side').addEventListener('click', (e) => {
+const btnResSide = document.getElementById('btn-res-side');
+btnResSide.addEventListener('click', (e) => {
   e.stopPropagation();
+  document.getElementById('res-strip').classList.toggle('left-side');
+});
+btnResSide.addEventListener('touchend', (e) => {
+  e.stopPropagation();
+  e.preventDefault();
   document.getElementById('res-strip').classList.toggle('left-side');
 });
 
