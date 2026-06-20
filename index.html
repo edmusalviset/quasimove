@@ -610,17 +610,18 @@ function makeDriveCurve(amount) {
 }
 
 // ---- Calcul de la position de filtre (0..1) selon inclinaison latérale ----
+// ±25° au lieu de ±45° : plus sensible, petits mouvements = grands effets
 function filterPosForGamma(dGamma) {
-  return Math.max(0, Math.min(1, (dGamma + 45) / 90));
+  return Math.max(0, Math.min(1, (dGamma + 25) / 50));
 }
 
-// Fréquence de coupure : 200 Hz (gauche) → 5000 Hz (droite), log
+// Fréquence de coupure : 60 Hz (gauche, très sombre) → 12000 Hz (droite, très brillant)
 function freqForPos(pos) {
-  return 200 * Math.pow(5000 / 200, pos);
+  return 60 * Math.pow(12000 / 60, pos);
 }
 
 function pitchForBeta(dBeta) {
-  const norm = Math.max(-1, Math.min(1, dBeta / 45));
+  const norm = Math.max(-1, Math.min(1, dBeta / 30));
   return Math.pow(2, norm * PITCH_RANGE / 2);
 }
 
@@ -802,8 +803,8 @@ document.getElementById('btn-play').addEventListener('click', () => {
 });
 // ---- BANDE DE RÉSONANCE TACTILE ----
 // Q de 0.8 (doux) à 12 (quasi auto-oscillant), en bas = doux, en haut = fort
-const Q_MIN = 0.5, Q_MAX = 40;
-let currentQ = 1.5;
+const Q_MIN = 0.7, Q_MAX = 20;
+let currentQ = 0.7; // démarre neutre — l'utilisateur monte pour entendre
 
 function qFromStripPos(pct) {
   return Q_MIN * Math.pow(Q_MAX / Q_MIN, pct);
