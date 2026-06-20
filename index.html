@@ -610,31 +610,23 @@ function makeDriveCurve(amount) {
 }
 
 // ---- Calcul de la position de filtre (0..1) selon inclinaison latérale ----
-// On ne change plus de type : on utilise une position continue 0→1
-// qui pilote 3 gains en fondu croisé (LP → BP → HP)
 function filterPosForGamma(dGamma) {
-  // dGamma : -45 = tout à gauche, +45 = tout à droite → 0..1
   return Math.max(0, Math.min(1, (dGamma + 45) / 90));
 }
 
-// Fréquence continue sur toute la plage, indépendante du type
+// Fréquence de coupure : 80 Hz (tout à gauche, très sombre) → 8000 Hz (tout à droite, très brillant)
 function freqForPos(pos) {
-  return 40 * Math.pow(8000 / 40, pos);
+  return 80 * Math.pow(8000 / 80, pos);
 }
 
 function pitchForBeta(dBeta) {
-  const norm = Math.max(-1, Math.min(1, dBeta/45));
-  return Math.pow(2, norm * PITCH_RANGE/2);
+  const norm = Math.max(-1, Math.min(1, dBeta / 45));
+  return Math.pow(2, norm * PITCH_RANGE / 2);
 }
 
-// ---- Démarrage audio : 3 filtres parallèles + fondu croisé ----
-function makeResoCurve(drive) {
-  // Saturation douce tanh : donne du grain sans clic
-  const n = 1024, c = new Float32Array(n);
-  const k = Math.max(0.001, drive), norm = Math.tanh(k);
-  for (let i = 0; i < n; i++) c[i] = Math.tanh(k * ((i / (n-1)) * 2 - 1)) / norm;
-  return c;
-}
+// ---- Chaîne audio : simple et efficace ----
+// src → LP (balayage gauche/droite) → peaking (résonance) → master → out
+// Le LP donne la couleur, le peaking booste fort à la fréquence de coupure
 
 function startPerfAudio(type) {
   const buf = generateBuffer(type);
@@ -644,63 +636,48 @@ function startPerfAudio(type) {
   src.loopStart = 0;
   src.loopEnd = buf.duration;
 
-  // ---- Étage 1 : drive avant le filtre (s'intensifie avec la résonance) ----
-  const drive = audioCtx.createWaveShaper();
-  drive.curve = makeResoCurve(1 + (currentQ / Q_MAX) * 6);
+  // Filtre passe-bas : la fréquence de coupure pilote le balayage latéral
+  // À gauche → son sombre, à droite → son brillant
+  const lp = audioCtx.createBiquadFilter();
+  lp.type = 'lowpass';
+  lp.frequency.value = 800; // position centrale au démarrage
+  lp.Q.value = 0.7;         // neutre — pas de résonance propre
 
-  // ---- Étage 2 : 3 filtres parallèles pour la couleur (LP/BP/HP) ----
-  const LP = audioCtx.createBiquadFilter(); LP.type = 'lowpass';  LP.Q.value = 1; LP.frequency.value = 800;
-  const BP = audioCtx.createBiquadFilter(); BP.type = 'bandpass'; BP.Q.value = 1; BP.frequency.value = 800;
-  const HP = audioCtx.createBiquadFilter(); HP.type = 'highpass'; HP.Q.value = 1; HP.frequency.value = 800;
-
-  const gLP = audioCtx.createGain(); gLP.gain.value = 1;
-  const gBP = audioCtx.createGain(); gBP.gain.value = 0;
-  const gHP = audioCtx.createGain(); gHP.gain.value = 0;
-
-  // Nœud de mixage des 3 couleurs
-  const mix = audioCtx.createGain(); mix.gain.value = 0.85;
-
-  // ---- Étage 3 : filtre résonant en SÉRIE après le mix — c'est lui qui hurle ----
-  const reso = audioCtx.createBiquadFilter();
-  reso.type = 'bandpass';
-  reso.frequency.value = 800;
-  reso.Q.value = currentQ;
-
-  // Gain de compensation : haute résonance = volume naturellement bas, on compense
-  const compGain = audioCtx.createGain();
-  const qNorm = Math.max(0, (currentQ - Q_MIN) / (Q_MAX - Q_MIN));
-  compGain.gain.value = 1 + qNorm * 2.5;
+  // Filtre peaking en série : booste FORT à la fréquence de coupure
+  // C'est lui qui crée la résonance audible (type peaking = boost pur, pas d'atténuation)
+  const peak = audioCtx.createBiquadFilter();
+  peak.type = 'peaking';
+  peak.frequency.value = 800;
+  peak.Q.value = currentQ;
+  peak.gain.value = qToDb(currentQ); // 0 dB au repos, jusqu'à +24 dB en haut
 
   const master = audioCtx.createGain();
-  master.gain.value = (parseInt(document.getElementById('perf-vol').value) || 100) / 100 * 0.6;
+  master.gain.value = (parseInt(document.getElementById('perf-vol').value) || 100) / 100 * 0.75;
 
-  // Câblage : src → drive → [LP/BP/HP] → mix → reso → compGain → master → out
-  src.connect(drive);
-  drive.connect(LP); drive.connect(BP); drive.connect(HP);
-  LP.connect(gLP); BP.connect(gBP); HP.connect(gHP);
-  gLP.connect(mix); gBP.connect(mix); gHP.connect(mix);
-  mix.connect(reso);
-  reso.connect(compGain);
-  compGain.connect(master);
+  src.connect(lp);
+  lp.connect(peak);
+  peak.connect(master);
   master.connect(audioCtx.destination);
 
   src.start();
   perfState.src = src;
-  perfState.LP = LP; perfState.BP = BP; perfState.HP = HP;
-  perfState.gLP = gLP; perfState.gBP = gBP; perfState.gHP = gHP;
-  perfState.reso = reso;
-  perfState.drive = drive;
-  perfState.compGain = compGain;
+  perfState.lp = lp;
+  perfState.peak = peak;
   perfState.master = master;
 }
 
 function stopPerfAudio() {
   if (perfState.src) { try { perfState.src.stop(); } catch(e) {} }
   perfState.src = null;
-  perfState.LP = null; perfState.BP = null; perfState.HP = null;
-  perfState.gLP = null; perfState.gBP = null; perfState.gHP = null;
-  perfState.reso = null; perfState.drive = null; perfState.compGain = null;
+  perfState.lp = null;
+  perfState.peak = null;
   perfState.master = null;
+}
+
+// Convertit Q (0.5..40) en gain peaking en dB (0..+24 dB)
+function qToDb(q) {
+  const norm = Math.max(0, Math.min(1, (q - Q_MIN) / (Q_MAX - Q_MIN)));
+  return norm * 24; // 0 à +24 dB
 }
 
 // ---- Volume live ----
@@ -726,36 +703,26 @@ function onOrientation(e) {
   const dBeta  = e.beta  - perfState.betaCenter;
   const dGamma = e.gamma - perfState.gammaCenter;
   const actx = audioCtx.currentTime;
-  const RAMP = 0.15; // 150 ms — lissage généreux, élimine tout décrochage audible
+  const RAMP = 0.12;
 
-  // Pitch
+  // Pitch (haut/bas)
   const pitch = pitchForBeta(dBeta);
   if (perfState.src) perfState.src.playbackRate.setTargetAtTime(pitch, actx, RAMP);
 
-  // Position filtre 0..1 → fondu croisé continu avec courbes cosinus (énergie constante)
+  // Filtre (gauche/droite) : LP + peaking suivent la même fréquence
   const pos = filterPosForGamma(dGamma);
   const freq = freqForPos(pos);
-  const gL = Math.cos(pos * Math.PI / 2);       // 1→0 sur toute la plage
-  const gH = Math.sin(pos * Math.PI / 2);       // 0→1 sur toute la plage
-  const gB = Math.sin(pos * Math.PI);           // pic au centre, 0 aux bords
-
-  if (perfState.gLP) {
-    perfState.gLP.gain.setTargetAtTime(gL, actx, RAMP);
-    perfState.gBP.gain.setTargetAtTime(gB, actx, RAMP);
-    perfState.gHP.gain.setTargetAtTime(gH, actx, RAMP);
-    perfState.LP.frequency.setTargetAtTime(freq, actx, RAMP);
-    perfState.BP.frequency.setTargetAtTime(freq, actx, RAMP);
-    perfState.HP.frequency.setTargetAtTime(freq, actx, RAMP);
-    // Le filtre résonant série suit la même fréquence de balayage
-    if (perfState.reso) perfState.reso.frequency.setTargetAtTime(freq, actx, RAMP);
+  if (perfState.lp) {
+    perfState.lp.frequency.setTargetAtTime(freq, actx, RAMP);
+    perfState.peak.frequency.setTargetAtTime(freq, actx, RAMP);
   }
 
-  // Affichage — longueur fixe, pas de saut de mise en page
+  // Affichage
   const semitones = Math.round(12 * Math.log2(pitch) * 10) / 10;
   const sign = semitones >= 0 ? '+' : '';
-  const typeLabel = pos < 0.35 ? 'PB' : pos > 0.65 ? 'PH' : 'BP';
+  const freqLabel = freq < 300 ? 'GRAVE' : freq < 2000 ? 'MÉDIUM' : 'AIGU';
   document.getElementById('perf-pitch').textContent = sign + semitones + ' st';
-  document.getElementById('perf-filter').textContent = typeLabel + ' · ' + Math.round(freq) + ' Hz';
+  document.getElementById('perf-filter').textContent = freqLabel + ' · ' + Math.round(freq) + ' Hz';
 
   // Visualiseur dot : gamma → x, beta → y (inversé)
   const nx = Math.max(0, Math.min(1, (dGamma + 45) / 90));
@@ -901,27 +868,9 @@ resStrip.addEventListener('touchmove', (e) => {
 function applyQ(q) {
   if (!audioCtx) return;
   const now = audioCtx.currentTime;
-  const RAMP = 0.06;
-
-  // Filtre résonant série — c'est lui qui fait le son spectaculaire
-  if (perfState.reso) perfState.reso.Q.setTargetAtTime(q, now, RAMP);
-
-  // Les filtres parallèles restent doux pour la couleur (Q fixe bas)
-  // Drive : plus de Q = plus de grain qui pousse dans le filtre
-  if (perfState.drive) {
-    const dAmt = 1 + (q / Q_MAX) * 8;
-    perfState.drive.curve = makeResoCurve(dAmt);
-  }
-
-  // Gain de compensation : la résonance serre la bande → moins de volume
-  if (perfState.compGain) {
-    const qNorm = Math.max(0, (q - Q_MIN) / (Q_MAX - Q_MIN));
-    perfState.compGain.gain.setTargetAtTime(1 + qNorm * 3, now, RAMP);
-  }
-
-  // Le filtre série suit aussi la fréquence courante de la couleur
-  if (perfState.reso && perfState.LP) {
-    perfState.reso.frequency.setTargetAtTime(perfState.LP.frequency.value, now, RAMP);
+  if (perfState.peak) {
+    perfState.peak.Q.setTargetAtTime(q, now, 0.06);
+    perfState.peak.gain.setTargetAtTime(qToDb(q), now, 0.06);
   }
 }
 
