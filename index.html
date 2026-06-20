@@ -295,6 +295,7 @@
     border-left: 1px solid var(--border);
     touch-action: none;
     user-select: none;
+    transition: none;
   }
   #res-strip.visible { display: flex; }
   #res-strip-label-top {
@@ -433,9 +434,8 @@ let audioCtx = null;
 let impulseSourceBuffer = null;
 let selectedType = null;
 let perfState = {
-  active: false, src: null, shaper: null,
-  LP: null, BP: null, HP: null,
-  gLP: null, gBP: null, gHP: null,
+  active: false, src: null,
+  lp: null, peak: null, master: null,
   handler: null, eventName: null, calibrated: false,
   betaCenter: 0, gammaCenter: 0
 };
@@ -610,24 +610,21 @@ function makeDriveCurve(amount) {
 }
 
 // ---- Calcul de la position de filtre (0..1) selon inclinaison latérale ----
-// On ne change plus de type : on utilise une position continue 0→1
-// qui pilote 3 gains en fondu croisé (LP → BP → HP)
 function filterPosForGamma(dGamma) {
-  // dGamma : -45 = tout à gauche, +45 = tout à droite → 0..1
   return Math.max(0, Math.min(1, (dGamma + 45) / 90));
 }
 
-// Fréquence continue sur toute la plage, indépendante du type
+// Fréquence de coupure : 80 Hz (tout à gauche, très sombre) → 8000 Hz (tout à droite, très brillant)
 function freqForPos(pos) {
-  return 40 * Math.pow(8000 / 40, pos);
+  return 80 * Math.pow(8000 / 80, pos);
 }
 
 function pitchForBeta(dBeta) {
-  const norm = Math.max(-1, Math.min(1, dBeta/45));
-  return Math.pow(2, norm * PITCH_RANGE/2);
+  const norm = Math.max(-1, Math.min(1, dBeta / 45));
+  return Math.pow(2, norm * PITCH_RANGE / 2);
 }
 
-// ---- Démarrage audio : 3 filtres parallèles + fondu croisé ----
+// ---- Chaîne audio : LP (balayage) + peaking (résonance) ----
 function startPerfAudio(type) {
   const buf = generateBuffer(type);
   const src = audioCtx.createBufferSource();
@@ -636,36 +633,47 @@ function startPerfAudio(type) {
   src.loopStart = 0;
   src.loopEnd = buf.duration;
 
-  // 3 filtres parallèles — sans WaveShaper (évite la dureté aux transitions)
-  const LP = audioCtx.createBiquadFilter(); LP.type = 'lowpass';  LP.Q.value = currentQ; LP.frequency.value = 800;
-  const BP = audioCtx.createBiquadFilter(); BP.type = 'bandpass'; BP.Q.value = currentQ; BP.frequency.value = 800;
-  const HP = audioCtx.createBiquadFilter(); HP.type = 'highpass'; HP.Q.value = currentQ; HP.frequency.value = 800;
+  // Filtre passe-bas : fréquence pilotée par le balayage latéral
+  const lp = audioCtx.createBiquadFilter();
+  lp.type = 'lowpass';
+  lp.frequency.value = 800;
+  lp.Q.value = 0.7;
 
-  const gLP = audioCtx.createGain(); gLP.gain.value = 1;
-  const gBP = audioCtx.createGain(); gBP.gain.value = 0;
-  const gHP = audioCtx.createGain(); gHP.gain.value = 0;
+  // Filtre peaking en série : booste à la fréquence de coupure
+  // Q et gain contrôlés par la bande tactile
+  const peak = audioCtx.createBiquadFilter();
+  peak.type = 'peaking';
+  peak.frequency.value = 800;
+  peak.Q.value = currentQ;
+  peak.gain.value = qToDb(currentQ);
 
   const master = audioCtx.createGain();
   master.gain.value = (parseInt(document.getElementById('perf-vol').value) || 100) / 100 * 0.75;
 
-  src.connect(LP); src.connect(BP); src.connect(HP);
-  LP.connect(gLP); BP.connect(gBP); HP.connect(gHP);
-  gLP.connect(master); gBP.connect(master); gHP.connect(master);
+  src.connect(lp);
+  lp.connect(peak);
+  peak.connect(master);
   master.connect(audioCtx.destination);
 
   src.start();
   perfState.src = src;
-  perfState.LP = LP; perfState.BP = BP; perfState.HP = HP;
-  perfState.gLP = gLP; perfState.gBP = gBP; perfState.gHP = gHP;
+  perfState.lp = lp;
+  perfState.peak = peak;
   perfState.master = master;
 }
 
 function stopPerfAudio() {
   if (perfState.src) { try { perfState.src.stop(); } catch(e) {} }
   perfState.src = null;
-  perfState.LP = null; perfState.BP = null; perfState.HP = null;
-  perfState.gLP = null; perfState.gBP = null; perfState.gHP = null;
+  perfState.lp = null;
+  perfState.peak = null;
   perfState.master = null;
+}
+
+// Q → gain en dB pour le filtre peaking (0 à +24 dB)
+function qToDb(q) {
+  const norm = Math.max(0, Math.min(1, (q - Q_MIN) / (Q_MAX - Q_MIN)));
+  return norm * 24;
 }
 
 // ---- Volume live ----
@@ -691,34 +699,26 @@ function onOrientation(e) {
   const dBeta  = e.beta  - perfState.betaCenter;
   const dGamma = e.gamma - perfState.gammaCenter;
   const actx = audioCtx.currentTime;
-  const RAMP = 0.15; // 150 ms — lissage généreux, élimine tout décrochage audible
+  const RAMP = 0.12;
 
-  // Pitch
+  // Pitch (haut/bas)
   const pitch = pitchForBeta(dBeta);
   if (perfState.src) perfState.src.playbackRate.setTargetAtTime(pitch, actx, RAMP);
 
-  // Position filtre 0..1 → fondu croisé continu avec courbes cosinus (énergie constante)
+  // Filtre (gauche/droite) : LP + peaking suivent la même fréquence
   const pos = filterPosForGamma(dGamma);
   const freq = freqForPos(pos);
-  const gL = Math.cos(pos * Math.PI / 2);       // 1→0 sur toute la plage
-  const gH = Math.sin(pos * Math.PI / 2);       // 0→1 sur toute la plage
-  const gB = Math.sin(pos * Math.PI);           // pic au centre, 0 aux bords
-
-  if (perfState.gLP) {
-    perfState.gLP.gain.setTargetAtTime(gL, actx, RAMP);
-    perfState.gBP.gain.setTargetAtTime(gB, actx, RAMP);
-    perfState.gHP.gain.setTargetAtTime(gH, actx, RAMP);
-    perfState.LP.frequency.setTargetAtTime(freq, actx, RAMP);
-    perfState.BP.frequency.setTargetAtTime(freq, actx, RAMP);
-    perfState.HP.frequency.setTargetAtTime(freq, actx, RAMP);
+  if (perfState.lp) {
+    perfState.lp.frequency.setTargetAtTime(freq, actx, RAMP);
+    if (perfState.peak) perfState.peak.frequency.setTargetAtTime(freq, actx, RAMP);
   }
 
-  // Affichage — longueur fixe, pas de saut de mise en page
+  // Affichage
   const semitones = Math.round(12 * Math.log2(pitch) * 10) / 10;
   const sign = semitones >= 0 ? '+' : '';
-  const typeLabel = pos < 0.35 ? 'PB' : pos > 0.65 ? 'PH' : 'BP';
+  const freqLabel = freq < 300 ? 'GRAVE' : freq < 2000 ? 'MÉDIUM' : 'AIGU';
   document.getElementById('perf-pitch').textContent = sign + semitones + ' st';
-  document.getElementById('perf-filter').textContent = typeLabel + ' · ' + Math.round(freq) + ' Hz';
+  document.getElementById('perf-filter').textContent = freqLabel + ' · ' + Math.round(freq) + ' Hz';
 
   // Visualiseur dot : gamma → x, beta → y (inversé)
   const nx = Math.max(0, Math.min(1, (dGamma + 45) / 90));
@@ -822,11 +822,10 @@ document.getElementById('btn-play').addEventListener('click', () => {
 });
 // ---- BANDE DE RÉSONANCE TACTILE ----
 // Q de 0.8 (doux) à 12 (quasi auto-oscillant), en bas = doux, en haut = fort
-const Q_MIN = 0.8, Q_MAX = 12;
-let currentQ = 1.5; // valeur par défaut plus marquée qu'avant
+const Q_MIN = 0.5, Q_MAX = 40;
+let currentQ = 1.5;
 
 function qFromStripPos(pct) {
-  // pct : 0 = bas (doux), 1 = haut (résonant) — courbe log pour plus de précision en bas
   return Q_MIN * Math.pow(Q_MAX / Q_MIN, pct);
 }
 
@@ -863,10 +862,11 @@ resStrip.addEventListener('touchmove', (e) => {
 }, { passive: false });
 
 function applyQ(q) {
-  const now = audioCtx ? audioCtx.currentTime : 0;
-  if (perfState.LP) { perfState.LP.Q.setTargetAtTime(q, now, 0.05); }
-  if (perfState.BP) { perfState.BP.Q.setTargetAtTime(q, now, 0.05); }
-  if (perfState.HP) { perfState.HP.Q.setTargetAtTime(q, now, 0.05); }
+  if (!audioCtx || !perfState.peak) return;
+  const now = audioCtx.currentTime;
+  perfState.peak.Q.setTargetAtTime(q, now, 0.06);
+  perfState.peak.gain.setTargetAtTime(qToDb(q), now, 0.06);
+  if (perfState.lp) perfState.lp.frequency.value; // accès pour sync
 }
 
 document.getElementById('btn-stop-perf').addEventListener('click', stopPerf);
