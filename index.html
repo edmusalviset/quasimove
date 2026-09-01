@@ -150,21 +150,6 @@
     border-color: var(--red);
     color: #fff;
   }
-  #btn-mode-toggle {
-    width: 100%;
-    padding: 12px;
-    font-size: 12px;
-    font-family: 'Space Mono', monospace;
-    letter-spacing: 1px;
-    background: var(--surface2);
-    border-color: var(--border);
-    color: var(--dim);
-  }
-  #btn-mode-toggle.tactile {
-    background: rgba(var(--accent3-rgb, 255,100,30), 0.15);
-    border-color: var(--accent3);
-    color: var(--accent3);
-  }
 
   /* ---- PERFORMANCE OVERLAY ---- */
   #perf-overlay {
@@ -386,7 +371,6 @@
 
   <div id="play-bar">
     <div class="selected-name" id="selected-name">—</div>
-    <button id="btn-mode-toggle">📐 GYROSCOPE</button>
     <button id="btn-play">▶ JOUER</button>
   </div>
 
@@ -448,13 +432,14 @@ const IMPULSE_MP3_B64 = "//uQZAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWGluZwA
 let audioCtx = null;
 let impulseSourceBuffer = null;
 let selectedType = null;
-let touchMode = false; // false = gyroscope, true = contrôle tactile XY
 let perfState = {
   active: false, src: null, shaper: null,
   LP: null, BP: null, HP: null,
   gLP: null, gBP: null, gHP: null,
+  reso: null, drive: null, compGain: null, master: null,
   handler: null, eventName: null, calibrated: false,
-  betaCenter: 0, gammaCenter: 0
+  betaCenter: 0, gammaCenter: 0,
+  sensorWatchdog: null
 };
 
 // ---- PITCH ± 3 octaves selon inclinaison verticale ----
@@ -736,6 +721,9 @@ function onOrientation(e) {
   lastGyroTime = now;
 
   if (!perfState.calibrated) {
+    // Premier signal valide : annuler le watchdog et confirmer à l'écran
+    if (perfState.sensorWatchdog) { clearTimeout(perfState.sensorWatchdog); perfState.sensorWatchdog = null; }
+    document.getElementById('perf-pitch').textContent = '📡 calibration…';
     perfState.betaCenter = e.beta;
     perfState.gammaCenter = e.gamma;
     perfState.calibrated = true;
@@ -745,45 +733,43 @@ function onOrientation(e) {
   const actx = audioCtx.currentTime;
   const RAMP = 0.15; // 150 ms — lissage généreux, élimine tout décrochage audible
 
-  if (!touchMode) {
-    // Pitch
-    const pitch = pitchForBeta(dBeta);
-    if (perfState.src) perfState.src.playbackRate.setTargetAtTime(pitch, actx, RAMP);
+  // Pitch
+  const pitch = pitchForBeta(dBeta);
+  if (perfState.src) perfState.src.playbackRate.setTargetAtTime(pitch, actx, RAMP);
 
-    // Position filtre 0..1 → fondu croisé continu avec courbes cosinus (énergie constante)
-    const pos = filterPosForGamma(dGamma);
-    const freq = freqForPos(pos);
-    const gL = Math.cos(pos * Math.PI / 2);       // 1→0 sur toute la plage
-    const gH = Math.sin(pos * Math.PI / 2);       // 0→1 sur toute la plage
-    const gB = Math.sin(pos * Math.PI);           // pic au centre, 0 aux bords
+  // Position filtre 0..1 → fondu croisé continu avec courbes cosinus (énergie constante)
+  const pos = filterPosForGamma(dGamma);
+  const freq = freqForPos(pos);
+  const gL = Math.cos(pos * Math.PI / 2);       // 1→0 sur toute la plage
+  const gH = Math.sin(pos * Math.PI / 2);       // 0→1 sur toute la plage
+  const gB = Math.sin(pos * Math.PI);           // pic au centre, 0 aux bords
 
-    if (perfState.gLP) {
-      perfState.gLP.gain.setTargetAtTime(gL, actx, RAMP);
-      perfState.gBP.gain.setTargetAtTime(gB, actx, RAMP);
-      perfState.gHP.gain.setTargetAtTime(gH, actx, RAMP);
-      perfState.LP.frequency.setTargetAtTime(freq, actx, RAMP);
-      perfState.BP.frequency.setTargetAtTime(freq, actx, RAMP);
-      perfState.HP.frequency.setTargetAtTime(freq, actx, RAMP);
-      // Le filtre résonant série suit la même fréquence de balayage
-      if (perfState.reso) perfState.reso.frequency.setTargetAtTime(freq, actx, RAMP);
-    }
-
-    // Affichage — longueur fixe, pas de saut de mise en page
-    const semitones = Math.round(12 * Math.log2(pitch) * 10) / 10;
-    const sign = semitones >= 0 ? '+' : '';
-    const typeLabel = pos < 0.35 ? 'PB' : pos > 0.65 ? 'PH' : 'BP';
-    document.getElementById('perf-pitch').textContent = sign + semitones + ' st';
-    document.getElementById('perf-filter').textContent = typeLabel + ' · ' + Math.round(freq) + ' Hz';
-
-    // Visualiseur dot : gamma → x, beta → y (inversé)
-    const nx = Math.max(0, Math.min(1, (dGamma + 45) / 90));
-    const ny = Math.max(0, Math.min(1, (dBeta + 45) / 90));
-    const dot = document.getElementById('viz-dot');
-    dot.style.left = (nx * 100) + '%';
-    dot.style.top  = ((1-ny) * 100) + '%';
-    const def = SOUND_TYPES.find(d => d.type === selectedType);
-    if (def) { dot.style.background = def.color; dot.style.boxShadow = `0 0 14px 4px ${def.color}`; }
+  if (perfState.gLP) {
+    perfState.gLP.gain.setTargetAtTime(gL, actx, RAMP);
+    perfState.gBP.gain.setTargetAtTime(gB, actx, RAMP);
+    perfState.gHP.gain.setTargetAtTime(gH, actx, RAMP);
+    perfState.LP.frequency.setTargetAtTime(freq, actx, RAMP);
+    perfState.BP.frequency.setTargetAtTime(freq, actx, RAMP);
+    perfState.HP.frequency.setTargetAtTime(freq, actx, RAMP);
+    // Le filtre résonant série suit la même fréquence de balayage
+    if (perfState.reso) perfState.reso.frequency.setTargetAtTime(freq, actx, RAMP);
   }
+
+  // Affichage — longueur fixe, pas de saut de mise en page
+  const semitones = Math.round(12 * Math.log2(pitch) * 10) / 10;
+  const sign = semitones >= 0 ? '+' : '';
+  const typeLabel = pos < 0.35 ? 'PB' : pos > 0.65 ? 'PH' : 'BP';
+  document.getElementById('perf-pitch').textContent = sign + semitones + ' st';
+  document.getElementById('perf-filter').textContent = typeLabel + ' · ' + Math.round(freq) + ' Hz';
+
+  // Visualiseur dot : gamma → x, beta → y (inversé)
+  const nx = Math.max(0, Math.min(1, (dGamma + 45) / 90));
+  const ny = Math.max(0, Math.min(1, (dBeta + 45) / 90));
+  const dot = document.getElementById('viz-dot');
+  dot.style.left = (nx * 100) + '%';
+  dot.style.top  = ((1-ny) * 100) + '%';
+  const def = SOUND_TYPES.find(d => d.type === selectedType);
+  if (def) { dot.style.background = def.color; dot.style.boxShadow = `0 0 14px 4px ${def.color}`; }
 }
 
 // ---- Démarrage mode perf ----
@@ -803,22 +789,27 @@ async function startPerf() {
 
   perfState.calibrated = false;
   document.getElementById('perf-sound-name').textContent = SOUND_TYPES.find(d=>d.type===selectedType)?.label || '—';
-  document.getElementById('perf-pitch').textContent = 'bouge le téléphone…';
+  document.getElementById('perf-pitch').textContent = '📡 en attente…';
   document.getElementById('perf-filter').textContent = '…';
 
   startPerfAudio(selectedType);
 
-  // Essai deviceorientationabsolute (Android Chrome) puis deviceorientation (iOS)
-  let fired = false;
-  const probe = () => { fired = true; };
-  window.addEventListener('deviceorientationabsolute', probe, { once: true });
-  setTimeout(() => {
-    window.removeEventListener('deviceorientationabsolute', probe);
-    const evt = fired ? 'deviceorientationabsolute' : 'deviceorientation';
-    perfState.handler = onOrientation;
-    perfState.eventName = evt;
-    window.addEventListener(evt, perfState.handler);
-  }, 400);
+  // Écoute des DEUX types d'événements simultanément, sans délai.
+  // Sur Android (Samsung inclus), deviceorientationabsolute et deviceorientation
+  // coexistent souvent — le throttle 33 ms dans onOrientation filtre les doublons.
+  // On abandonne la sonde 400 ms qui ratait sur certains appareils.
+  perfState.handler = onOrientation;
+  perfState.eventName = 'both';
+  window.addEventListener('deviceorientationabsolute', onOrientation);
+  window.addEventListener('deviceorientation', onOrientation);
+
+  // Watchdog : si aucun événement n'arrive dans les 4 s, on le signale
+  perfState.sensorWatchdog = setTimeout(() => {
+    if (!perfState.calibrated && perfState.active) {
+      document.getElementById('perf-pitch').textContent = '⚠️ capteur inactif';
+      document.getElementById('perf-filter').textContent = 'essaie mode TACTILE';
+    }
+  }, 4000);
 
   document.getElementById('perf-overlay').classList.add('visible');
   document.getElementById('res-strip').classList.add('visible');
@@ -829,9 +820,10 @@ async function startPerf() {
 }
 
 function stopPerf() {
+  if (perfState.sensorWatchdog) { clearTimeout(perfState.sensorWatchdog); perfState.sensorWatchdog = null; }
   if (perfState.handler) {
-    window.removeEventListener(perfState.eventName || 'deviceorientation', perfState.handler);
     window.removeEventListener('deviceorientationabsolute', perfState.handler);
+    window.removeEventListener('deviceorientation', perfState.handler);
   }
   perfState.handler = null; perfState.eventName = null; perfState.active = false;
   stopPerfAudio();
@@ -945,77 +937,6 @@ function applyQ(q) {
 }
 
 document.getElementById('btn-stop-perf').addEventListener('click', stopPerf);
-
-// ---- BASCULE GYRO / TACTILE ----
-document.getElementById('btn-mode-toggle').addEventListener('click', () => {
-  touchMode = !touchMode;
-  const btn = document.getElementById('btn-mode-toggle');
-  btn.textContent = touchMode ? '👆 TACTILE' : '📐 GYROSCOPE';
-  btn.classList.toggle('tactile', touchMode);
-});
-
-// ---- CONTRÔLE TACTILE XY (mode tablette) ----
-// Zone : #perf-viz — X = filtre (gauche=sombre, droite=brillant), Y = hauteur (haut=aigu, bas=grave)
-function applyPerfTouch(touch) {
-  if (!touchMode || !perfState.active || !audioCtx) return;
-  const viz = document.getElementById('perf-viz');
-  const rect = viz.getBoundingClientRect();
-  const x = Math.max(0, Math.min(1, (touch.clientX - rect.left) / rect.width));
-  const y = Math.max(0, Math.min(1, (touch.clientY - rect.top)  / rect.height));
-
-  // X → position filtre 0..1
-  const pos = x;
-  const freq = freqForPos(pos);
-
-  // Y → pitch (haut = aigu, bas = grave) — même amplitude que le gyro (±PITCH_RANGE/2 demi-tons)
-  const pitchNorm = 1 - y; // 0=bas=grave, 1=haut=aigu
-  const pitch = Math.pow(2, (pitchNorm * 2 - 1) * PITCH_RANGE / 2);
-
-  const actx = audioCtx.currentTime;
-  const RAMP = 0.08;
-
-  if (perfState.src) perfState.src.playbackRate.setTargetAtTime(pitch, actx, RAMP);
-
-  const gL = Math.cos(pos * Math.PI / 2);
-  const gH = Math.sin(pos * Math.PI / 2);
-  const gB = Math.sin(pos * Math.PI);
-
-  if (perfState.gLP) {
-    perfState.gLP.gain.setTargetAtTime(gL, actx, RAMP);
-    perfState.gBP.gain.setTargetAtTime(gB, actx, RAMP);
-    perfState.gHP.gain.setTargetAtTime(gH, actx, RAMP);
-    perfState.LP.frequency.setTargetAtTime(freq, actx, RAMP);
-    perfState.BP.frequency.setTargetAtTime(freq, actx, RAMP);
-    perfState.HP.frequency.setTargetAtTime(freq, actx, RAMP);
-    if (perfState.reso) perfState.reso.frequency.setTargetAtTime(freq, actx, RAMP);
-  }
-
-  // Affichage
-  const semitones = Math.round(12 * Math.log2(pitch) * 10) / 10;
-  const sign = semitones >= 0 ? '+' : '';
-  const typeLabel = pos < 0.35 ? 'PB' : pos > 0.65 ? 'PH' : 'BP';
-  document.getElementById('perf-pitch').textContent = sign + semitones + ' st';
-  document.getElementById('perf-filter').textContent = typeLabel + ' · ' + Math.round(freq) + ' Hz';
-
-  // Dot
-  const dot = document.getElementById('viz-dot');
-  dot.style.left = (x * 100) + '%';
-  dot.style.top  = (y * 100) + '%';
-  const def = SOUND_TYPES.find(d => d.type === selectedType);
-  if (def) { dot.style.background = def.color; dot.style.boxShadow = `0 0 14px 4px ${def.color}`; }
-}
-
-const perfViz = document.getElementById('perf-viz');
-perfViz.addEventListener('touchstart', (e) => {
-  if (!touchMode) return;
-  e.preventDefault();
-  applyPerfTouch(e.touches[0]);
-}, { passive: false });
-perfViz.addEventListener('touchmove', (e) => {
-  if (!touchMode) return;
-  e.preventDefault();
-  applyPerfTouch(e.touches[0]);
-}, { passive: false });
 
 // ---- Chargement son source granulaire ----
 function loadImpulse() {
