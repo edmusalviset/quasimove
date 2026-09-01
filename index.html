@@ -841,14 +841,24 @@ async function startPerf() {
   window.addEventListener('deviceorientationabsolute', onOrientation);
   window.addEventListener('deviceorientation', onOrientation);
 
-  // Watchdog : si aucune donnée dans les 4 s, basculer automatiquement en TACTILE
-  perfState.sensorWatchdog = setTimeout(() => {
+  // Watchdog : si aucune donnée dans les 4 s → diagnostic et retour au menu
+  perfState.sensorWatchdog = setTimeout(async () => {
     if (!perfState.calibrated && perfState.active && !touchMode) {
-      touchMode = true;
-      document.getElementById('btn-mode-toggle').textContent = '👆 TACTILE';
-      document.getElementById('btn-mode-toggle').classList.add('tactile');
-      document.getElementById('perf-pitch').textContent = '👆 glisse sur la zone';
-      document.getElementById('perf-filter').textContent = 'capteur introuvable → tactile';
+      let detail = 'Vérifie : Paramètres Android → Apps → Chrome → Autorisations → Capteurs physiques';
+      try {
+        const [pa, pg] = await Promise.all([
+          navigator.permissions.query({ name: 'accelerometer' }),
+          navigator.permissions.query({ name: 'gyroscope' })
+        ]);
+        if (pa.state === 'denied' || pg.state === 'denied')
+          detail = 'Permission refusée — Paramètres Android → Apps → Chrome → Autorisations';
+        else if (pa.state === 'granted' && pg.state === 'granted')
+          detail = 'Permission OK mais pas de signal — essaie Samsung Internet';
+      } catch(e) { /* permissions API indisponible */ }
+      document.getElementById('perf-pitch').textContent = '⚠️ capteur introuvable';
+      document.getElementById('perf-filter').textContent = detail;
+      // Retour au menu après 3 s supplémentaires
+      setTimeout(() => { if (perfState.active && !perfState.calibrated) stopPerf(); }, 3000);
     }
   }, 4000);
 
