@@ -150,6 +150,21 @@
     border-color: var(--red);
     color: #fff;
   }
+  #btn-mode-toggle {
+    width: 100%;
+    padding: 11px;
+    font-size: 11px;
+    font-family: 'Space Mono', monospace;
+    letter-spacing: 1px;
+    background: var(--surface2);
+    border-color: var(--border);
+    color: var(--dim);
+  }
+  #btn-mode-toggle.tactile {
+    border-color: var(--accent3, #ff8040);
+    color: var(--accent3, #ff8040);
+    background: rgba(255,128,64,0.1);
+  }
 
   /* ---- PERFORMANCE OVERLAY ---- */
   #perf-overlay {
@@ -371,6 +386,7 @@
 
   <div id="play-bar">
     <div class="selected-name" id="selected-name">—</div>
+    <button id="btn-mode-toggle">📐 GYROSCOPE</button>
     <button id="btn-play">▶ JOUER</button>
   </div>
 
@@ -713,36 +729,37 @@ document.getElementById('perf-vol').addEventListener('input', (e) => {
 });
 
 // ---- Gestionnaire orientation (~30 fps max) ----
+// ---- touchMode (GYRO vs TACTILE) ----
+let touchMode = false;
+
+// ---- Traitement commun des données d'orientation (gyro legacy OU Generic Sensor) ----
 let lastGyroTime = 0;
-function onOrientation(e) {
-  if (e.beta === null || e.gamma === null) return;
+function processOrientation(beta, gamma) {
+  if (touchMode) return; // mode tactile actif : ignorer le capteur
   const now = performance.now();
   if (now - lastGyroTime < 33) return;
   lastGyroTime = now;
 
   if (!perfState.calibrated) {
-    // Premier signal valide : annuler le watchdog et confirmer à l'écran
     if (perfState.sensorWatchdog) { clearTimeout(perfState.sensorWatchdog); perfState.sensorWatchdog = null; }
     document.getElementById('perf-pitch').textContent = '📡 calibration…';
-    perfState.betaCenter = e.beta;
-    perfState.gammaCenter = e.gamma;
+    perfState.betaCenter = beta;
+    perfState.gammaCenter = gamma;
     perfState.calibrated = true;
   }
-  const dBeta  = e.beta  - perfState.betaCenter;
-  const dGamma = e.gamma - perfState.gammaCenter;
+  const dBeta  = beta  - perfState.betaCenter;
+  const dGamma = gamma - perfState.gammaCenter;
   const actx = audioCtx.currentTime;
-  const RAMP = 0.15; // 150 ms — lissage généreux, élimine tout décrochage audible
+  const RAMP = 0.15;
 
-  // Pitch
   const pitch = pitchForBeta(dBeta);
   if (perfState.src) perfState.src.playbackRate.setTargetAtTime(pitch, actx, RAMP);
 
-  // Position filtre 0..1 → fondu croisé continu avec courbes cosinus (énergie constante)
   const pos = filterPosForGamma(dGamma);
   const freq = freqForPos(pos);
-  const gL = Math.cos(pos * Math.PI / 2);       // 1→0 sur toute la plage
-  const gH = Math.sin(pos * Math.PI / 2);       // 0→1 sur toute la plage
-  const gB = Math.sin(pos * Math.PI);           // pic au centre, 0 aux bords
+  const gL = Math.cos(pos * Math.PI / 2);
+  const gH = Math.sin(pos * Math.PI / 2);
+  const gB = Math.sin(pos * Math.PI);
 
   if (perfState.gLP) {
     perfState.gLP.gain.setTargetAtTime(gL, actx, RAMP);
@@ -751,25 +768,28 @@ function onOrientation(e) {
     perfState.LP.frequency.setTargetAtTime(freq, actx, RAMP);
     perfState.BP.frequency.setTargetAtTime(freq, actx, RAMP);
     perfState.HP.frequency.setTargetAtTime(freq, actx, RAMP);
-    // Le filtre résonant série suit la même fréquence de balayage
     if (perfState.reso) perfState.reso.frequency.setTargetAtTime(freq, actx, RAMP);
   }
 
-  // Affichage — longueur fixe, pas de saut de mise en page
   const semitones = Math.round(12 * Math.log2(pitch) * 10) / 10;
   const sign = semitones >= 0 ? '+' : '';
   const typeLabel = pos < 0.35 ? 'PB' : pos > 0.65 ? 'PH' : 'BP';
   document.getElementById('perf-pitch').textContent = sign + semitones + ' st';
   document.getElementById('perf-filter').textContent = typeLabel + ' · ' + Math.round(freq) + ' Hz';
 
-  // Visualiseur dot : gamma → x, beta → y (inversé)
   const nx = Math.max(0, Math.min(1, (dGamma + 45) / 90));
-  const ny = Math.max(0, Math.min(1, (dBeta + 45) / 90));
+  const ny = Math.max(0, Math.min(1, (dBeta  + 45) / 90));
   const dot = document.getElementById('viz-dot');
   dot.style.left = (nx * 100) + '%';
   dot.style.top  = ((1-ny) * 100) + '%';
   const def = SOUND_TYPES.find(d => d.type === selectedType);
   if (def) { dot.style.background = def.color; dot.style.boxShadow = `0 0 14px 4px ${def.color}`; }
+}
+
+// Legacy DeviceOrientation events (iOS Safari + Android Chrome)
+function onOrientation(e) {
+  if (e.beta === null || e.gamma === null) return;
+  processOrientation(e.beta, e.gamma);
 }
 
 // ---- Démarrage mode perf ----
@@ -794,20 +814,41 @@ async function startPerf() {
 
   startPerfAudio(selectedType);
 
-  // Écoute des DEUX types d'événements simultanément, sans délai.
-  // Sur Android (Samsung inclus), deviceorientationabsolute et deviceorientation
-  // coexistent souvent — le throttle 33 ms dans onOrientation filtre les doublons.
-  // On abandonne la sonde 400 ms qui ratait sur certains appareils.
+  // -- Écoute capteur : Generic Sensor API (Chrome Android) + legacy DeviceOrientation --
+  // Generic Sensor API (RelativeOrientationSensor) : plus fiable sur certains Android Samsung
+  perfState.genericSensor = null;
+  if (!touchMode && 'RelativeOrientationSensor' in window) {
+    try {
+      const sensor = new RelativeOrientationSensor({ frequency: 30, referenceFrame: 'device' });
+      sensor.addEventListener('reading', () => {
+        const [qx, qy, qz, qw] = sensor.quaternion;
+        // Quaternion → angles équivalents à beta / gamma
+        const beta  = Math.atan2(2*(qw*qx + qy*qz), 1 - 2*(qx*qx + qy*qy)) * 180/Math.PI;
+        const gamma = Math.asin(Math.max(-1, Math.min(1, 2*(qw*qy - qz*qx)))) * 180/Math.PI;
+        processOrientation(beta, gamma);
+      });
+      sensor.addEventListener('error', (ev) => console.warn('RelativeOrientationSensor:', ev.error?.name));
+      sensor.start();
+      perfState.genericSensor = sensor;
+    } catch(err) {
+      console.warn('Generic Sensor API non disponible:', err.message);
+    }
+  }
+
+  // Legacy DeviceOrientation (iOS Safari + fallback Android)
   perfState.handler = onOrientation;
   perfState.eventName = 'both';
   window.addEventListener('deviceorientationabsolute', onOrientation);
   window.addEventListener('deviceorientation', onOrientation);
 
-  // Watchdog : si aucun événement n'arrive dans les 4 s, on le signale
+  // Watchdog : si aucune donnée dans les 4 s, basculer automatiquement en TACTILE
   perfState.sensorWatchdog = setTimeout(() => {
-    if (!perfState.calibrated && perfState.active) {
-      document.getElementById('perf-pitch').textContent = '⚠️ capteur inactif';
-      document.getElementById('perf-filter').textContent = 'essaie mode TACTILE';
+    if (!perfState.calibrated && perfState.active && !touchMode) {
+      touchMode = true;
+      document.getElementById('btn-mode-toggle').textContent = '👆 TACTILE';
+      document.getElementById('btn-mode-toggle').classList.add('tactile');
+      document.getElementById('perf-pitch').textContent = '👆 glisse sur la zone';
+      document.getElementById('perf-filter').textContent = 'capteur introuvable → tactile';
     }
   }, 4000);
 
@@ -824,6 +865,10 @@ function stopPerf() {
   if (perfState.handler) {
     window.removeEventListener('deviceorientationabsolute', perfState.handler);
     window.removeEventListener('deviceorientation', perfState.handler);
+  }
+  if (perfState.genericSensor) {
+    try { perfState.genericSensor.stop(); } catch(e) {}
+    perfState.genericSensor = null;
   }
   perfState.handler = null; perfState.eventName = null; perfState.active = false;
   stopPerfAudio();
@@ -937,6 +982,65 @@ function applyQ(q) {
 }
 
 document.getElementById('btn-stop-perf').addEventListener('click', stopPerf);
+
+// ---- Bouton GYRO / TACTILE ----
+document.getElementById('btn-mode-toggle').addEventListener('click', () => {
+  touchMode = !touchMode;
+  const btn = document.getElementById('btn-mode-toggle');
+  btn.textContent = touchMode ? '👆 TACTILE' : '📐 GYROSCOPE';
+  btn.classList.toggle('tactile', touchMode);
+  if (touchMode && perfState.active) {
+    document.getElementById('perf-pitch').textContent = '👆 glisse sur la zone';
+    document.getElementById('perf-filter').textContent = '…';
+  }
+});
+
+// ---- Zone de jeu tactile XY (#perf-viz) ----
+// X = filtre (gauche sombre → droite brillant), Y = hauteur (haut aigu → bas grave)
+function applyTouchXY(touch) {
+  if (!touchMode || !perfState.active || !audioCtx) return;
+  const viz = document.getElementById('perf-viz');
+  const rect = viz.getBoundingClientRect();
+  const x = Math.max(0, Math.min(1, (touch.clientX - rect.left) / rect.width));
+  const y = Math.max(0, Math.min(1, (touch.clientY - rect.top)  / rect.height));
+
+  const pos   = x;
+  const freq  = freqForPos(pos);
+  const pitch = Math.pow(2, ((1 - y) * 2 - 1) * PITCH_RANGE / 2);
+
+  const actx = audioCtx.currentTime;
+  const RAMP = 0.08;
+  if (perfState.src) perfState.src.playbackRate.setTargetAtTime(pitch, actx, RAMP);
+
+  const gL = Math.cos(pos * Math.PI / 2);
+  const gH = Math.sin(pos * Math.PI / 2);
+  const gB = Math.sin(pos * Math.PI);
+  if (perfState.gLP) {
+    perfState.gLP.gain.setTargetAtTime(gL, actx, RAMP);
+    perfState.gBP.gain.setTargetAtTime(gB, actx, RAMP);
+    perfState.gHP.gain.setTargetAtTime(gH, actx, RAMP);
+    perfState.LP.frequency.setTargetAtTime(freq, actx, RAMP);
+    perfState.BP.frequency.setTargetAtTime(freq, actx, RAMP);
+    perfState.HP.frequency.setTargetAtTime(freq, actx, RAMP);
+    if (perfState.reso) perfState.reso.frequency.setTargetAtTime(freq, actx, RAMP);
+  }
+
+  const semitones = Math.round(12 * Math.log2(pitch) * 10) / 10;
+  const sign = semitones >= 0 ? '+' : '';
+  const typeLabel = pos < 0.35 ? 'PB' : pos > 0.65 ? 'PH' : 'BP';
+  document.getElementById('perf-pitch').textContent = sign + semitones + ' st';
+  document.getElementById('perf-filter').textContent = typeLabel + ' · ' + Math.round(freq) + ' Hz';
+
+  const dot = document.getElementById('viz-dot');
+  dot.style.left = (x * 100) + '%';
+  dot.style.top  = (y * 100) + '%';
+  const def = SOUND_TYPES.find(d => d.type === selectedType);
+  if (def) { dot.style.background = def.color; dot.style.boxShadow = `0 0 14px 4px ${def.color}`; }
+}
+
+const perfViz = document.getElementById('perf-viz');
+perfViz.addEventListener('touchstart', (e) => { if (touchMode) { e.preventDefault(); applyTouchXY(e.touches[0]); } }, { passive: false });
+perfViz.addEventListener('touchmove',  (e) => { if (touchMode) { e.preventDefault(); applyTouchXY(e.touches[0]); } }, { passive: false });
 
 // ---- Chargement son source granulaire ----
 function loadImpulse() {
